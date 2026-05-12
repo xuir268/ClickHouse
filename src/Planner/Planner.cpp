@@ -61,9 +61,11 @@
 #include <Analyzer/ConstantNode.h>
 #include <Analyzer/FunctionNode.h>
 #include <Analyzer/InterpolateNode.h>
+#include <Analyzer/ListNode.h>
 #include <Analyzer/TableNode.h>
 #include <Analyzer/TableFunctionNode.h>
 #include <Analyzer/QueryNode.h>
+#include <Analyzer/SortNode.h>
 #include <Analyzer/UnionNode.h>
 #include <Analyzer/QueryTreeBuilder.h>
 #include <Analyzer/AggregationUtils.h>
@@ -84,6 +86,7 @@
 #include <Planner/PlannerSorting.h>
 #include <Planner/PlannerWindowFunctions.h>
 #include <Planner/Utils.h>
+#include <Functions/FunctionFactory.h>
 #include <base/types.h>
 
 
@@ -165,6 +168,99 @@ namespace ErrorCodes
 
 namespace
 {
+
+constexpr UInt64 max_shuffle_limit_for_order_by_rand_fast_path = 1000;
+
+std::optional<UInt64> tryGetSmallShuffleLimitForOrderByRandFastPath(const QueryNode & query_node)
+{
+    if (!query_node.isShuffle()
+        || query_node.hasOrderBy()
+        || !query_node.hasLimit()
+        || query_node.hasOffset()
+        || query_node.isLimitWithTies())
+    {
+        return {};
+    }
+
+    const auto * limit_node = query_node.getLimit()->as<ConstantNode>();
+    if (!limit_node || limit_node->getValue().getType() != Field::Types::UInt64)
+        return {};
+
+    auto limit = limit_node->getValue().safeGet<UInt64>();
+    if (limit == 0 || limit > max_shuffle_limit_for_order_by_rand_fast_path)
+        return {};
+
+    return limit;
+}
+
+void addRandomOrderBy(ListNode & order_by_list_node, ContextPtr context)
+{
+    auto & function_factory = FunctionFactory::instance();
+    auto resolver = function_factory.get("rand", context);
+    auto rand_function_node = std::make_shared<FunctionNode>("rand");
+    rand_function_node->resolveAsFunction(resolver);
+
+    auto sort_node = std::make_shared<SortNode>(rand_function_node);
+    order_by_list_node.getNodes().push_back(std::move(sort_node));
+}
+
+QueryTreeNodePtr rewriteSmallShuffleLimitQueryAsOrderByRandSubquery(const QueryTreeNodePtr & query_tree)
+{
+    const auto * query_node = query_tree->as<QueryNode>();
+    if (!query_node)
+        return query_tree;
+
+    auto small_shuffle_limit = tryGetSmallShuffleLimitForOrderByRandFastPath(*query_node);
+    if (!small_shuffle_limit)
+        return query_tree;
+
+    auto rewritten_inner_query_tree = query_tree->clone();
+    auto & rewritten_inner_query_node = rewritten_inner_query_tree->as<QueryNode &>();
+
+    auto limit_node = rewritten_inner_query_node.getLimit()->clone();
+
+    const auto original_projection_columns = rewritten_inner_query_node.getProjectionColumns();
+    Names inner_projection_aliases;
+    inner_projection_aliases.reserve(original_projection_columns.size());
+    for (size_t i = 0; i < original_projection_columns.size(); ++i)
+        inner_projection_aliases.push_back("__shuffle_subquery_column_" + toString(i));
+
+    rewritten_inner_query_node.clearProjectionColumns();
+    rewritten_inner_query_node.setProjectionAliasesToOverride(inner_projection_aliases);
+    rewritten_inner_query_node.resolveProjectionColumns(original_projection_columns);
+    rewritten_inner_query_node.setIsShuffle(false);
+    rewritten_inner_query_node.setIsSubquery(true);
+    rewritten_inner_query_node.getLimit() = {};
+
+    auto outer_query_node = std::make_shared<QueryNode>(Context::createCopy(query_node->getContext()));
+    outer_query_node->getJoinTree() = rewritten_inner_query_tree;
+
+    Names original_projection_aliases;
+    original_projection_aliases.reserve(original_projection_columns.size());
+
+    NamesAndTypes outer_projection_columns;
+    outer_projection_columns.reserve(original_projection_columns.size());
+
+    auto & outer_projection_nodes = outer_query_node->getProjection().getNodes();
+    outer_projection_nodes.reserve(original_projection_columns.size());
+
+    for (size_t i = 0; i < original_projection_columns.size(); ++i)
+    {
+        const auto & original_projection_column = original_projection_columns[i];
+        original_projection_aliases.push_back(original_projection_column.name);
+
+        NameAndTypePair outer_projection_column{inner_projection_aliases[i], original_projection_column.type};
+        outer_projection_columns.push_back(outer_projection_column);
+        outer_projection_nodes.push_back(std::make_shared<ColumnNode>(outer_projection_column, rewritten_inner_query_tree));
+    }
+
+    outer_query_node->setProjectionAliasesToOverride(original_projection_aliases);
+    outer_query_node->resolveProjectionColumns(outer_projection_columns);
+    addRandomOrderBy(outer_query_node->getOrderBy(), outer_query_node->getContext());
+    outer_query_node->getLimit() = std::move(limit_node);
+
+    return outer_query_node;
+}
 
 /** Check that table and table function table expressions from planner context support transactions.
   *
@@ -1755,7 +1851,7 @@ PlannerContextPtr buildPlannerContext(const QueryTreeNodePtr & query_tree_node,
 Planner::Planner(const QueryTreeNodePtr & query_tree_,
     SelectQueryOptions & select_query_options_,
     const ActionsDAG * post_filter_)
-    : query_tree(query_tree_)
+    : query_tree(rewriteSmallShuffleLimitQueryAsOrderByRandSubquery(query_tree_))
     , select_query_options(select_query_options_)
     , planner_context(buildPlannerContext(query_tree, select_query_options,
         std::make_shared<GlobalPlannerContext>(
@@ -1768,9 +1864,9 @@ Planner::Planner(const QueryTreeNodePtr & query_tree_,
 Planner::Planner(const QueryTreeNodePtr & query_tree_,
     SelectQueryOptions & select_query_options_,
     GlobalPlannerContextPtr global_planner_context_)
-    : query_tree(query_tree_)
+    : query_tree(rewriteSmallShuffleLimitQueryAsOrderByRandSubquery(query_tree_))
     , select_query_options(select_query_options_)
-    , planner_context(buildPlannerContext(query_tree_, select_query_options, std::move(global_planner_context_)))
+    , planner_context(buildPlannerContext(query_tree, select_query_options, std::move(global_planner_context_)))
 {
 }
 
@@ -2353,7 +2449,11 @@ void Planner::buildPlanForQueryNode()
             addWithFillStepIfNeeded(query_plan, query_analysis_result, expression_analysis_result.getSort(), planner_context, query_node, select_query_options, useful_sets);
 
         const bool apply_limit = query_processing_info.getToStage() != QueryProcessingStage::WithMergeableStateAfterAggregation;
-        const bool apply_offset = query_processing_info.getToStage() != QueryProcessingStage::WithMergeableStateAfterAggregationAndLimit;
+        /// `isToAggregationState` covers both `WithMergeableStateAfterAggregation` (stage 3) and
+        /// `WithMergeableStateAfterAggregationAndLimit` (stage 4). OFFSET must not be applied at
+        /// either stage because OFFSET means skipping rows from the entire query result, not from each
+        /// shard individually.
+        const bool apply_offset = !query_processing_info.isToAggregationState();
         bool shuffle_limit_applied = false;
         if (query_node.isShuffle())
         {
@@ -2373,12 +2473,6 @@ void Planner::buildPlanForQueryNode()
 
             addShuffleStep(query_plan, shuffle_limit, select_query_options.max_step_description_length);
         }
-
-        /// `isToAggregationState` covers both `WithMergeableStateAfterAggregation` (stage 3) and
-        /// `WithMergeableStateAfterAggregationAndLimit` (stage 4). OFFSET must not be applied at
-        /// either stage because OFFSET means skipping rows from the entire query result, not from each
-        /// shard individually.
-        const bool apply_offset = !query_processing_info.isToAggregationState();
         if (query_node.hasLimit() && query_node.isLimitWithTies() && apply_limit && apply_offset)
             addLimitStep(query_plan, query_analysis_result, planner_context, query_node);
 
