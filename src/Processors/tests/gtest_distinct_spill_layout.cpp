@@ -147,6 +147,8 @@ TEST(DistinctSpillLayout, FloatSuppressionUsesInputFingerprints)
     EXPECT_EQ(
         std::set<UInt128>(ordinary_keys.begin(), ordinary_keys.end()),
         std::set<UInt128>(suppression_keys.begin(), suppression_keys.end()));
+}
+
 TEST(DistinctSpillLayout, ServiceColumnsMatchActualAllocation)
 {
     const auto header = std::make_shared<const Block>(Block{
