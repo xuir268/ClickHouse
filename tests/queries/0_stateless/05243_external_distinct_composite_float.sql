@@ -6,11 +6,11 @@ SET max_untracked_memory = 0;
 SET optimize_distinct_in_order = 0;
 SET allow_preliminary_distinct_abandoning = 0;
 
-SELECT count(), uniqExact(reinterpretAsUInt64(f), s)
+SELECT count(), uniqExact(reinterpretAsUInt64(f), u)
 FROM
 (
     SELECT DISTINCT
         reinterpretAsFloat64([toUInt64(9223372036854775808), 0, 4609434218613702656][number + 1]) AS f,
-        ['same', 'same', 'other'][number + 1] AS s
+        [toUInt64(7), 7, 8][number + 1] AS u
     FROM numbers(3)
 );
